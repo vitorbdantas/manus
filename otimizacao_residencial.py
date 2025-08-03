@@ -1,9 +1,13 @@
 from ortools.sat.python import cp_model
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 def otimizar_agendamento_residencial():
+    """
+    Otimiza o agendamento de aparelhos residenciais para minimizar o pico de demanda
+    """
     dados_aparelhos = [
         (1, 'Carro Elétrico', 7000, 4, 22, 6),
         (1, 'Boiler', 2000, 2, 0, 5),
@@ -22,139 +26,246 @@ def otimizar_agendamento_residencial():
         (10, 'Boiler', 2000, 2, 0, 4),
     ]
 
-    horizonte = 24 * 60
+    print("=== DADOS DOS APARELHOS ===")
+    print("Residência | Aparelho        | Potência (W) | Duração (h) | Início (h) | Fim (h)")
+    print("-" * 85)
+    for res_id, aparelho, potencia, dur_h, ini_h, fim_h in dados_aparelhos:
+        print(f"    {res_id:2d}     | {aparelho:15s} | {potencia:8d}     | {dur_h:7.1f}     | {ini_h:6d}     | {fim_h:4d}")
+    print()
+
+    # Configuração do modelo
+    horizonte = 24  # Trabalhar em horas para simplificar
     modelo = cp_model.CpModel()
+    
+    # Variáveis do modelo
     variaveis = {}
+    tarefas_info = {}
 
     for res_id, aparelho, potencia, dur_h, ini_h, fim_h in dados_aparelhos:
-        tarefa_id = f'Res{res_id}_{aparelho}'
-        dur_min = int(dur_h * 60)
-        ini_min = ini_h * 60
-        fim_min = fim_h * 60
-
-        if fim_min <= ini_min:
-            fim_min += 1440
-
-        inicio_var = modelo.NewIntVar(ini_min, fim_min - dur_min, f'{tarefa_id}_inicio')
-        intervalo_var = modelo.NewIntervalVar(inicio_var, dur_min, inicio_var + dur_min, f'{tarefa_id}_intervalo')
-
+        tarefa_id = f'Res{res_id}_{aparelho.replace(" ", "_")}'
+        
+        # Ajustar janela de tempo se cruzar meia-noite
+        if fim_h <= ini_h:
+            fim_h += 24
+            
+        # Criar variável de início (em horas)
+        max_inicio = fim_h - dur_h
+        inicio_var = modelo.NewIntVar(ini_h, max_inicio, f'{tarefa_id}_inicio')
+        
+        # Armazenar informações
         variaveis[tarefa_id] = {
-            'intervalo': intervalo_var,
-            'potencia': potencia,
             'inicio': inicio_var,
-            'duracao': dur_min
+            'duracao': dur_h,
+            'potencia': potencia
+        }
+        
+        tarefas_info[tarefa_id] = {
+            'res_id': res_id,
+            'aparelho': aparelho,
+            'potencia': potencia,
+            'duracao': dur_h,
+            'janela_inicio': ini_h,
+            'janela_fim': fim_h
         }
 
-    demanda_por_minuto = [modelo.NewIntVar(0, 100000, f'demanda_{m}') for m in range(horizonte)]
+    # Criar variáveis de demanda por hora
+    demanda_por_hora = []
+    for h in range(24):
+        demanda_por_hora.append(modelo.NewIntVar(0, 100000, f'demanda_hora_{h}'))
 
-    for m in range(horizonte):
-        contrib = []
-        for tarefa_id, var in variaveis.items():
-            start = var['inicio']
-            dur = var['duracao']
-            potencia = var['potencia']
+    # Modelar a demanda em cada hora
+    for h in range(24):
+        consumo_nesta_hora = []
+        
+        for tarefa_id, var_info in variaveis.items():
+            inicio_var = var_info['inicio']
+            duracao = var_info['duracao']
+            potencia = var_info['potencia']
+            
+            # Criar variáveis booleanas para cada hora de operação
+            for dur_offset in range(int(duracao)):
+                hora_operacao = h
+                
+                # Variável booleana: tarefa está ativa nesta hora?
+                ativa_var = modelo.NewBoolVar(f'{tarefa_id}_ativa_h{h}_dur{dur_offset}')
+                
+                # Restrições: ativa somente se a tarefa começou e ainda não terminou
+                modelo.Add(inicio_var + dur_offset == hora_operacao).OnlyEnforceIf(ativa_var)
+                modelo.Add(inicio_var + dur_offset != hora_operacao).OnlyEnforceIf(ativa_var.Not())
+                
+                consumo_nesta_hora.append(ativa_var * potencia)
+        
+        # Definir demanda total nesta hora
+        if consumo_nesta_hora:
+            modelo.Add(demanda_por_hora[h] == sum(consumo_nesta_hora))
+        else:
+            modelo.Add(demanda_por_hora[h] == 0)
 
-            ativo = modelo.NewBoolVar(f'{tarefa_id}_ativo_em_{m}')
-            modelo.Add(m >= start).OnlyEnforceIf(ativo)
-            modelo.Add(m < start + dur).OnlyEnforceIf(ativo)
-            contrib.append(ativo * potencia)
+    # Objetivo: minimizar o pico de demanda
+    pico_demanda = modelo.NewIntVar(0, 100000, 'pico_demanda')
+    modelo.AddMaxEquality(pico_demanda, demanda_por_hora)
+    modelo.Minimize(pico_demanda)
 
-        modelo.Add(demanda_por_minuto[m] == sum(contrib))
-
-    pico = modelo.NewIntVar(0, 100000, 'pico_demanda')
-    modelo.AddMaxEquality(pico, demanda_por_minuto)
-    modelo.Minimize(pico)
-
+    # Resolver o modelo
     solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30.0
     status = solver.Solve(modelo)
 
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
-        print("Solução encontrada!")
-        print(f"Pico de Demanda Otimizado: {solver.ObjectiveValue() / 1000:.2f} kW")
-
+        print("✅ Solução encontrada!")
+        pico_otimizado = solver.ObjectiveValue()
+        print(f"🎯 Pico de Demanda Otimizado: {pico_otimizado / 1000:.2f} kW")
+        
+        # Extrair agendamento
         agendamento = []
-        for tarefa_id, var in variaveis.items():
-            inicio = solver.Value(var['inicio'])
+        agendamento_detalhado = {}
+        
+        for tarefa_id, var_info in variaveis.items():
+            inicio_otimizado = solver.Value(var_info['inicio'])
+            info = tarefas_info[tarefa_id]
+            
             agendamento.append({
                 'Tarefa': tarefa_id,
-                'Início (h)': int((inicio // 60) % 24),
-                'Início (min)': int(inicio % 60),
-                'Duração (h)': round(var['duracao'] / 60, 2)
+                'Residência': info['res_id'],
+                'Aparelho': info['aparelho'],
+                'Potência (W)': info['potencia'],
+                'Duração (h)': info['duracao'],
+                'Início Original (h)': info['janela_inicio'],
+                'Início Otimizado (h)': inicio_otimizado % 24,
+                'Fim Otimizado (h)': (inicio_otimizado + info['duracao']) % 24
             })
+            
+            agendamento_detalhado[tarefa_id] = {
+                'inicio': inicio_otimizado,
+                'duracao': info['duracao'],
+                'potencia': info['potencia']
+            }
 
         df = pd.DataFrame(agendamento)
-        print("\nAgendamento Otimizado:")
-        print(df)
-        return df, solver.ObjectiveValue(), dados_aparelhos
+        print("\n=== AGENDAMENTO OTIMIZADO ===")
+        print(df.to_string(index=False))
+        
+        # Calcular demanda otimizada hora por hora
+        demanda_otimizada_calculada = [0] * 24
+        for tarefa_id, dados in agendamento_detalhado.items():
+            inicio = dados['inicio']
+            duracao = int(dados['duracao'])
+            potencia = dados['potencia']
+            
+            for h in range(duracao):
+                hora_atual = (inicio + h) % 24
+                demanda_otimizada_calculada[hora_atual] += potencia
+        
+        print(f"\n📊 Demanda otimizada calculada (kW por hora): {[d/1000 for d in demanda_otimizada_calculada]}")
+        print(f"🔥 Pico calculado: {max(demanda_otimizada_calculada)/1000:.2f} kW")
+        
+        return df, pico_otimizado, dados_aparelhos, agendamento_detalhado
     else:
-        print("Não foi possível encontrar uma solução.")
-        return None, None, None
+        print("❌ Não foi possível encontrar uma solução.")
+        return None, None, None, None
 
 
 def calcular_demanda_nao_otimizada(dados_aparelhos):
-    demanda = [0] * 1440
+    """
+    Calcula a demanda sem otimização (horários originais)
+    """
+    demanda = [0] * 24  # 24 horas
 
-    for _, _, potencia, dur_h, ini_h, fim_h in dados_aparelhos:
-        inicio = ini_h * 60
-        duracao = int(dur_h * 60)
-        fim = fim_h * 60
-
-        if fim <= inicio:
-            fim += 1440
-
-        fim_real = min(inicio + duracao, fim)
-
-        for m in range(inicio, fim_real):
-            demanda[m % 1440] += potencia
+    print("\n=== CÁLCULO DEMANDA NÃO OTIMIZADA ===")
+    for res_id, aparelho, potencia, dur_h, ini_h, fim_h in dados_aparelhos:
+        print(f"Res{res_id} {aparelho}: {ini_h}h-{ini_h + dur_h}h, {potencia}W")
+        
+        for h in range(int(dur_h)):
+            hora_atual = (ini_h + h) % 24
+            demanda[hora_atual] += potencia
 
     return demanda
 
 
-def plotar_resultados(df_agendamento, dados_aparelhos):
+def plotar_resultados(df_agendamento, dados_aparelhos, agendamento_detalhado):
+    """
+    Plota comparação entre demanda otimizada e não otimizada
+    """
+    # Calcular demanda não otimizada
     demanda_nao_otimizada = calcular_demanda_nao_otimizada(dados_aparelhos)
-    demanda_otimizada = [0] * 1440
+    pico_nao_otimizado = max(demanda_nao_otimizada)
+    
+    # Calcular demanda otimizada
+    demanda_otimizada = [0] * 24
+    
+    if agendamento_detalhado:
+        print("\n=== CONSTRUÇÃO DEMANDA OTIMIZADA ===")
+        for tarefa_id, dados in agendamento_detalhado.items():
+            inicio = dados['inicio']
+            duracao = int(dados['duracao'])
+            potencia = dados['potencia']
+            
+            print(f"{tarefa_id}: início={inicio}h, duração={duracao}h, potência={potencia}W")
+            
+            for h in range(duracao):
+                hora_atual = (inicio + h) % 24
+                demanda_otimizada[hora_atual] += potencia
+                print(f"  Hora {hora_atual}: +{potencia}W = {demanda_otimizada[hora_atual]}W")
+    
+    pico_otimizado = max(demanda_otimizada)
+    
+    # Exibir dados no terminal
+    print(f"\n=== RESULTADOS FINAIS ===")
+    print(f"🔥 Pico NÃO otimizado: {pico_nao_otimizado/1000:.2f} kW")
+    print(f"⚡ Pico otimizado: {pico_otimizado/1000:.2f} kW")
+    print(f"💰 Redução do pico: {((pico_nao_otimizado - pico_otimizado)/pico_nao_otimizado)*100:.1f}%")
+    
+    print(f"\n📈 Demanda NÃO otimizada por hora (kW):")
+    for h in range(24):
+        print(f"  {h:2d}h: {demanda_nao_otimizada[h]/1000:6.2f} kW")
+    
+    print(f"\n📉 Demanda otimizada por hora (kW):")
+    for h in range(24):
+        print(f"  {h:2d}h: {demanda_otimizada[h]/1000:6.2f} kW")
 
-    print("Pico da demanda NÃO otimizada:", max(demanda_nao_otimizada) / 1000, "kW")
+    # Plotar gráfico
+    horas = list(range(24))
+    
+    plt.figure(figsize=(15, 8))
+    
+    # Converter para kW
+    demanda_nao_opt_kw = [d/1000 for d in demanda_nao_otimizada]
+    demanda_opt_kw = [d/1000 for d in demanda_otimizada]
+    
+    plt.plot(horas, demanda_nao_opt_kw,
+             label=f'Demanda Não Otimizada (Pico: {pico_nao_otimizado/1000:.2f} kW)',
+             color='red', linestyle='--', linewidth=2, marker='o', markersize=4)
+    
+    plt.plot(horas, demanda_opt_kw,
+             label=f'Demanda Otimizada (Pico: {pico_otimizado/1000:.2f} kW)',
+             color='green', linewidth=3, marker='s', markersize=4)
 
-    if df_agendamento is not None:
-        for _, row in df_agendamento.iterrows():
-            tarefa = row['Tarefa']
-            potencia = next(p for r, a, p, *_ in dados_aparelhos if f"Res{r}_{a}" == tarefa)
-            try:
-                inicio_min = int(row['Início (h)']) * 60 + int(row['Início (min)'])
-                duracao_min = int(float(row['Duração (h)']) * 60)
-            except Exception as e:
-                print(f"Erro ao processar {tarefa}: {e}")
-                continue
-
-            for i in range(duracao_min):
-                minuto = (inicio_min + i) % 1440
-                demanda_otimizada[minuto] += potencia
-
-    print("Primeiros valores da curva otimizada (W):", demanda_otimizada[:10])
-
-    horas = [i / 60 for i in range(1440)]
-
-    plt.figure(figsize=(15, 7))
-    plt.plot(horas, [v / 1000 for v in demanda_nao_otimizada],
-             label=f'Demanda Não Otimizada (Pico: {max(demanda_nao_otimizada)/1000:.2f} kW)',
-             color='red', linestyle='--')
-    plt.plot(horas, [v / 1000 for v in demanda_otimizada],
-             label=f'Demanda Otimizada (Pico: {max(demanda_otimizada)/1000:.2f} kW)',
-             color='green', linewidth=2)
-
-    plt.title("Comparação: Demanda com e sem Otimização")
-    plt.xlabel("Hora do Dia")
-    plt.ylabel("Demanda (kW)")
-    plt.xticks(range(0, 25, 2))
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.legend()
+    plt.title("Comparação: Demanda Elétrica com e sem Otimização", fontsize=16, fontweight='bold')
+    plt.xlabel("Hora do Dia", fontsize=12)
+    plt.ylabel("Demanda (kW)", fontsize=12)
+    plt.xticks(range(0, 24, 2))
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=11)
     plt.tight_layout()
-    plt.show()
+    
+    # Salvar gráfico
+    plt.savefig('comparacao_demanda.png', dpi=300, bbox_inches='tight')
+    print(f"\n💾 Gráfico salvo como 'comparacao_demanda.png'")
+    
+    # Tentar mostrar (pode não funcionar em ambiente sem display)
+    try:
+        plt.show()
+    except:
+        print("⚠️  Display não disponível para mostrar gráfico interativo")
 
 
 if __name__ == "__main__":
-    print("Iniciando otimização de agendamento de cargas residenciais...\n")
-    df_agendamento, pico, dados = otimizar_agendamento_residencial()
+    print("🚀 Iniciando otimização de agendamento de cargas residenciais...\n")
+    
+    df_agendamento, pico, dados, agendamento_detalhado = otimizar_agendamento_residencial()
+    
     if df_agendamento is not None:
-        plotar_resultados(df_agendamento, dados)
+        plotar_resultados(df_agendamento, dados, agendamento_detalhado)
+        print(f"\n✅ Otimização concluída com sucesso!")
+    else:
+        print(f"\n❌ Falha na otimização!")
